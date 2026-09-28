@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+
+"""Track the last 10 opened apps for the recent-apps bar widget.
+
+Subscribes to the Hyprland event socket and records newly opened and focused
+windows into recent-apps.json, most recent first, capped at 10 entries.
+
+Terminal windows are always recorded as the terminal app itself - one entry
+per terminal emulator - regardless of which CLI/TUI is running inside. A
+terminal hosting btop, python3 or opencode still shows a single entry for
+the terminal, never one per foreground program. Each app is listed once;
+re-opening or re-focusing an app just moves it to the front.
+
+Usage:
+    recent-apps          Daemon mode (runs forever, tracking events)
+    recent-apps --once   Capture current focus + running clients and exit
+    recent-apps --clear  Empty the recents list and exit
+"""
+
+import fcntl
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+
+OUT = os.path.expanduser("~/.config/omarchy/bar/recent-apps.json")
+LOCK = os.path.expanduser("~/.config/omarchy/bar/recent-apps.lock")
+MAX = 10
+
+# Window classes that are terminal emulators.
+TERMINALS = {
+    "alacritty", "kitty", "foot", "ghostty", "com.mitchellh.ghostty",
+    "wezterm", "tabby", "xterm", "urxvt", "st", "konsole",
+    "org.kde.konsole", "gnome-terminal", "org.gnome.Terminal",
+    "xfce4-terminal", "terminator", "tilix", "rio", "contour", "hyper",
+    "pantheon-terminal", "io.elementary.terminal",
+}
+
+# Friendly display names for the terminal emulators we recognize, so a
+# terminal row reads as the terminal app (e.g. "Alacritty") rather than as
+# whatever CLI/TUI happens to be running inside it.
+TERMINAL_NAMES = {
+    "alacritty": "Alacritty",
+    "kitty": "Kitty",
+    "foot": "Foot",
+    "ghostty": "Ghostty",
+    "com.mitchellh.ghostty": "Ghostty",
+    "wezterm": "WezTerm",
+    "tabby": "Tabby",
+    "xterm": "XTerm",
+    "urxvt": "urxvt",
+    "st": "st",
+    "konsole": "Konsole",
+    "org.kde.konsole": "Konsole",
+    "gnome-terminal": "GNOME Terminal",
+    "org.gnome.Terminal": "GNOME Terminal",
+    "xfce4-terminal": "XFCE Terminal",
+    "terminator": "Terminator",
+    "tilix": "Tilix",
+    "rio": "Rio",
+    "contour": "Contour",
+    "hyper": "Hyper",
+    "pantheon-terminal": "Pantheon Terminal",
+    "io.elementary.terminal": "Pantheon Terminal",
+}
+
+
+def is_terminal(cls):
+    return str(cls or "").strip().lower() in TERMINALS
+
+
+def terminal_name(cls):
+    key = str(cls or "").strip().lower()
+    return TERMINAL_NAMES.get(key, key) or "Terminal"
+
+
+def now_ms():
+    return int(time.time())
+
+
+def hyprctl_json(cmd):
+    try:
+        r = subprocess.run(
+            ["hyprctl", cmd, "-j"],
+            capture_output=True, text=True, timeout=3
+        )
+        return json.loads(r.stdout) if r.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def read_recents():
+    try:
+        with open(OUT) as f:
+            data = json.load(f)
+        return data.get("recents", [])[:MAX]
+    except Exception:
+        return []
+
+
+def write_recents(recents):
+    os.makedirs(os.path.dirname(OUT), exist_ok=True)
+    tmp = OUT + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"recents": recents[:MAX]}, f)
+    os.replace(tmp, OUT)
+
+
+def resolve_entry(cls, title=""):
+    """Resolve what a window is and how it should be listed.
+
+    Returns (kind, entry) where kind is 'term' or 'app':
+      - a terminal window        -> 'term' (the terminal app itself; one
+                                     entry per terminal emulator regardless
+                                     of which CLI/TUI runs inside)
+      - anything else            -> 'app' (class based)
+    """
+    cls = str(cls or "").strip()
+    t = now_ms()
+    if is_terminal(cls):
+        return "term", {"class": cls, "name": terminal_name(cls), "time": t}
+    return "app", {"class": cls, "name": str(title or cls).strip(), "time": t}
+
+
+def record(cls, title=""):
+    cls = str(cls or "").strip()
+    if not cls:
+        return
+    kind, entry = resolve_entry(cls, title)
+    recents = read_recents()
+    # Each app is listed once; re-opening or re-focusing just moves it to the
+    # front. Terminals never resolve to the CLI/TUI inside them, so every
+    # terminal window collapses into a single row for that terminal emulator.
+    recents = [r for r in recents if r.get("class") != cls]
+    recents.insert(0, entry)
+    write_recents(recents[:MAX])
+
+
+def seed_current_clients():
+    data = hyprctl_json("clients")
+    if not isinstance(data, list):
+        return
+    for c in reversed(data):
+        if c.get("mapped") and c.get("class"):
+            record(c["class"], c.get("title", ""))
+
+
+def record_active_window():
+    data = hyprctl_json("activewindow")
+    if data and data.get("class"):
+        record(data["class"], data.get("title", ""))
+
+
+def event_socket_path():
+    sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE", "")
+    xdg = os.environ.get("XDG_RUNTIME_DIR", "")
+    if not sig or not xdg:
+        return None
+    return os.path.join(xdg, "hypr", sig, ".socket2.sock")
+
+
+def daemon():
+    # Single-instance guard: another daemon is already running if we can't
+    # grab this advisory lock. --once mode intentionally skips the lock.
+    os.makedirs(os.path.dirname(LOCK), exist_ok=True)
+    lockfd = open(LOCK, "w")
+    try:
+        fcntl.flock(lockfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return
+
+    record_active_window()
+    seed_current_clients()
+
+    sock_path = event_socket_path()
+    if not sock_path:
+        print("recent-apps: no Hyprland event socket found", file=sys.stderr)
+        return
+
+    while True:
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.connect(sock_path)
+            s.settimeout(5)
+            buf = b""
+            while True:
+                try:
+                    chunk = s.recv(8192)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        line = line.decode("utf-8", errors="replace").strip()
+                        if line.startswith("openwindow>>"):
+                            payload = line[len("openwindow>>"):]
+                            parts = payload.split(",", 3)
+                            if len(parts) >= 4:
+                                record(parts[2], parts[3])
+                        elif line.startswith("activewindow>>"):
+                            payload = line[len("activewindow>>"):]
+                            p = payload.split(",")
+                            if len(p) >= 4 and p[0].startswith("0x"):
+                                cls = p[2]
+                                title = p[3]
+                            else:
+                                cls = p[0]
+                                title = p[1] if len(p) > 1 else ""
+                            if cls:
+                                record(cls, title)
+                except socket.timeout:
+                    continue
+            s.close()
+        except Exception:
+            time.sleep(2)
+
+
+def once():
+    record_active_window()
+    seed_current_clients()
+
+
+def clear():
+    write_recents([])
+
+
+if __name__ == "__main__":
+    if "--clear" in sys.argv:
+        clear()
+    elif "--once" in sys.argv:
+        once()
+    else:
+        daemon()

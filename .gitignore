@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.bak
+*.bak.*
+*.lock
+
+# Runtime state: the user's own app history.
+recent-apps.json
+
+# The manifest must never be ignored.
+!manifest.json

@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "robbie.recent-apps",
+  "name": "Recent Apps",
+  "version": "1.0.0",
+  "author": "robbie",
+  "license": "MIT",
+  "description": "Bar history button that drops a panel listing the last ten apps opened, with icons and one-click launch",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Recent Apps",
+    "description": "A history icon in the bar. Clicking opens a panel listing the last ten apps you opened, newest first, each with its icon and window titles; clicking a row launches or focuses that app.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
